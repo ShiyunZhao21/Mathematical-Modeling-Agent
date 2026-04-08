@@ -1,0 +1,21 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mathmodelagent_backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env.dev
+    environment:
+      - ENV=DEV
+    volumes:
+      - ./backend:/app
+      - ./backend/project/work_dir:/app/project/work_dir
+      - backend_venv:/app/.venv
+    stdin_open: true
+    tty: true
+
+volumes:
+  backend_venv:
