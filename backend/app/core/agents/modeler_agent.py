@@ -20,9 +20,25 @@ def repair_json(json_str: str) -> dict | None:
     json_str = json_str.replace("```json", "").replace("```", "").strip()
 
     try:
-        return json.loads(json_str)
+        parsed = json.loads(json_str)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
+
+    match = re.search(r"\{[\s\S]*\}", json_str)
+    if match:
+        candidate = match.group(0)
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            json_str = candidate
 
     try:
         fixed = re.sub(
@@ -31,7 +47,11 @@ def repair_json(json_str: str) -> dict | None:
             json_str,
             flags=re.DOTALL,
         )
-        return json.loads(fixed)
+        parsed = json.loads(fixed)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        if isinstance(parsed, dict):
+            return parsed
     except (json.JSONDecodeError, re.error):
         pass
 
@@ -127,6 +147,7 @@ class ModelerAgent(Agent):
             },
         ]
         raw_content = await simple_chat(self.model, history)
-        cleaned = raw_content.replace("```json", "").replace("```", "").strip()
-        payload = json.loads(cleaned)
+        payload = repair_json(raw_content)
+        if not payload:
+            raise ValueError(f"{question_key} 建模方案解析失败")
         return QuestionModelPlan(**payload)

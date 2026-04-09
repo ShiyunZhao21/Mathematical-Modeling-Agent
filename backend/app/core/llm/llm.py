@@ -1,6 +1,8 @@
 from app.utils.common_utils import transform_link, split_footnotes
 from app.utils.log_util import logger
 import time
+import json
+import httpx
 from app.schemas.response import (
     CoderMessage,
     WriterMessage,
@@ -32,6 +34,68 @@ class LLM:
         self.chat_count = 0
         self.max_tokens = max_tokens
         self.task_id = task_id
+
+    @staticmethod
+    def _extract_text_content(message) -> str | None:
+        if message is None:
+            return None
+
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content
+
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if text:
+                        text_parts.append(text)
+            if text_parts:
+                return "\n".join(text_parts)
+
+        return None
+
+    async def _fallback_anthropic_chat(self, history: list, top_p: float | None = None) -> dict:
+        if not self.base_url:
+            raise ValueError("缺少 base_url，无法执行回退请求")
+
+        system_prompt = None
+        messages = []
+        for item in history or []:
+            role = item.get("role")
+            content = item.get("content")
+            if role == "system":
+                system_prompt = f"{system_prompt}\n\n{content}" if system_prompt else content
+                continue
+            if role not in {"user", "assistant"}:
+                continue
+            if content is None:
+                continue
+            messages.append({"role": role, "content": content})
+
+        payload = {
+            "model": (self.model or "").split("/", 1)[-1],
+            "messages": messages,
+            "max_tokens": self.max_tokens or 4096,
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+        if top_p is not None:
+            payload["top_p"] = top_p
+
+        async with httpx.AsyncClient(timeout=300.0, trust_env=False) as client:
+            response = await client.post(
+                f"{self.base_url.rstrip('/')}/v1/messages",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
 
     async def chat(
         self,
@@ -78,6 +142,21 @@ class LLM:
                 logger.info(f"API返回: {response}")
                 if not response or not hasattr(response, "choices"):
                     raise ValueError("无效的API响应")
+
+                message = response.choices[0].message
+                if not getattr(message, "tool_calls", None):
+                    extracted_content = self._extract_text_content(message)
+                    if extracted_content is None:
+                        raw_response = await self._fallback_anthropic_chat(history, top_p=top_p)
+                        extracted_content = "\n".join(
+                            block.get("text", "")
+                            for block in raw_response.get("content", [])
+                            if isinstance(block, dict) and block.get("type") == "text"
+                        ).strip()
+                        if not extracted_content:
+                            raise ValueError("回退请求未获取到文本内容")
+                        message.content = extracted_content
+
                 self.chat_count += 1
                 await self.send_message(response, agent_name, sub_title)
                 return response
@@ -249,5 +328,16 @@ async def simple_chat(model: LLM, history: list) -> str:
         kwargs["base_url"] = model.base_url
 
     response = await acompletion(**kwargs)
+    content = model._extract_text_content(response.choices[0].message)
+    if content is not None:
+        return content
 
-    return response.choices[0].message.content
+    raw_response = await model._fallback_anthropic_chat(history)
+    content = "\n".join(
+        block.get("text", "")
+        for block in raw_response.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
+    if not content:
+        raise ValueError("模型未返回可用文本内容")
+    return content

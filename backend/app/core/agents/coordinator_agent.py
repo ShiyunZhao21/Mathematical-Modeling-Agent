@@ -1,6 +1,7 @@
 from app.core.agents.agent import Agent
 from app.core.llm.llm import LLM, simple_chat
 from app.core.prompts import COORDINATOR_PROMPT, MASTER_ANALYSIS_PROMPT
+from app.core.agents.modeler_agent import repair_json
 import json
 import re
 from app.utils.log_util import logger
@@ -32,14 +33,13 @@ class CoordinatorAgent(Agent):
                     agent_name=self.__class__.__name__,
                 )
                 json_str = response.choices[0].message.content
-
-                json_str = json_str.replace("```json", "").replace("```", "").strip()
-                json_str = re.sub(r"[\x00-\x1F\x7F]", "", json_str)
-
                 if not json_str:
                     raise ValueError("返回的 JSON 字符串为空")
 
-                questions = json.loads(json_str)
+                questions = repair_json(json_str)
+                if not questions:
+                    raise ValueError("返回内容无法解析为 JSON 对象")
+
                 ques_count = questions["ques_count"]
                 logger.info(f"questions:{questions}")
                 return CoordinatorToModeler(questions=questions, ques_count=ques_count)
@@ -98,6 +98,7 @@ class CoordinatorAgent(Agent):
             },
         ]
         raw_content = await simple_chat(self.model, history)
-        cleaned = raw_content.replace("```json", "").replace("```", "").strip()
-        payload = json.loads(cleaned)
+        payload = repair_json(raw_content)
+        if not payload:
+            raise ValueError("整体问题分析解析失败")
         return ProblemAnalysis(**payload)
