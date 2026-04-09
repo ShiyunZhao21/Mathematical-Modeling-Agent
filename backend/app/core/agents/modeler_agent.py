@@ -1,7 +1,14 @@
 from app.core.agents.agent import Agent
-from app.core.llm.llm import LLM
-from app.core.prompts import MODELER_PROMPT
-from app.schemas.A2A import CoordinatorToModeler, ModelerToCoder
+from app.core.llm.llm import LLM, simple_chat
+from app.core.prompts import MODELER_PROMPT, QUESTION_MODELER_PROMPT
+from app.schemas.A2A import (
+    ConclusionMemory,
+    CoordinatorToModeler,
+    ModelerToCoder,
+    ProblemAnalysis,
+    ProblemDigest,
+    QuestionModelPlan,
+)
 from app.utils.log_util import logger
 import json
 import re
@@ -12,13 +19,11 @@ def repair_json(json_str: str) -> dict | None:
     """Try to repair malformed JSON from LLM output."""
     json_str = json_str.replace("```json", "").replace("```", "").strip()
 
-    # Try direct parse first
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
         pass
 
-    # Fix unescaped newlines and quotes inside string values
     try:
         fixed = re.sub(
             r'(?<=: ")(.*?)(?=",\s*\n\s*"|"\s*\n\s*})',
@@ -30,7 +35,6 @@ def repair_json(json_str: str) -> dict | None:
     except (json.JSONDecodeError, re.error):
         pass
 
-    # Extract key-value pairs with regex as last resort
     try:
         pattern = r'"(\w+)"\s*:\s*"((?:[^"\\]|\\.|"(?!,\s*\n)|"(?!\s*\n\s*}))*)"'
         matches = re.findall(pattern, json_str, re.DOTALL)
@@ -88,10 +92,41 @@ class ModelerAgent(Agent):
             await self.append_chat_history(
                 {
                     "role": "user",
-                    "content": "你返回的JSON格式有误，请严格按照JSON格式重新输出，注意字符串值内的双引号必须转义为\\\"，不要包含未转义的特殊字符。",
+                    "content": '你返回的JSON格式有误，请严格按照JSON格式重新输出，注意字符串值内的双引号必须转义为\\"，不要包含未转义的特殊字符。',
                 }
             )
 
         raise ValueError(
             f"经过{max_parse_retries}次尝试仍无法解析JSON，请检查模型输出"
         )
+
+    async def run_for_question(
+        self,
+        question_key: str,
+        question_text: str,
+        problem_digest: ProblemDigest,
+        problem_analysis: ProblemAnalysis,
+        conclusion_memory: ConclusionMemory,
+    ) -> QuestionModelPlan:
+        history = [
+            {"role": "system", "content": QUESTION_MODELER_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "problem_digest": problem_digest.model_dump(mode="json"),
+                        "problem_analysis": problem_analysis.model_dump(mode="json"),
+                        "conclusion_memory": conclusion_memory.model_dump(mode="json"),
+                        "current_question": {
+                            "question_key": question_key,
+                            "question_text": question_text,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        raw_content = await simple_chat(self.model, history)
+        cleaned = raw_content.replace("```json", "").replace("```", "").strip()
+        payload = json.loads(cleaned)
+        return QuestionModelPlan(**payload)

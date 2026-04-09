@@ -22,10 +22,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="MathModelAgent Backend",
-    description="Backend-only math modeling agent service",
+    title="MathModelAgent 后端服务",
+    description="数学建模智能体后端服务。提供任务创建、任务状态查询、消息流、产物下载等接口。",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 app.include_router(common_router.router)

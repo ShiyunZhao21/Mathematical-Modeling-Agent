@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 
 
@@ -7,8 +7,46 @@ class CoordinatorToModeler(BaseModel):
     ques_count: int
 
 
+class ProblemDigest(BaseModel):
+    title: str = ""
+    background: str = ""
+    conditions: list[str] = Field(default_factory=list)
+    questions: dict[str, str] = Field(default_factory=dict)
+    files_summary: list[str] = Field(default_factory=list)
+    research_summary: str = ""
+
+
+class ProblemAnalysis(BaseModel):
+    overall_analysis: str = ""
+    question_links: dict[str, str] = Field(default_factory=dict)
+    per_question_guidance: dict[str, str] = Field(default_factory=dict)
+
+
+class QuestionModelPlan(BaseModel):
+    question_key: str
+    goal: str = ""
+    assumptions: list[str] = Field(default_factory=list)
+    variables_and_parameters: dict[str, str] = Field(default_factory=dict)
+    parameter_estimation: str = ""
+    model_method: str = ""
+    solution_steps: list[str] = Field(default_factory=list)
+    validation_plan: str = ""
+    formula_spec: str = ""
+    coder_prompt: str = ""
+    writer_context: str = ""
+    plan_markdown: str = ""
+
+
+class ConclusionMemory(BaseModel):
+    global_findings: list[str] = Field(default_factory=list)
+    per_question_findings: dict[str, list[str]] = Field(default_factory=dict)
+    shared_assumptions: list[str] = Field(default_factory=list)
+    shared_symbols: dict[str, str] = Field(default_factory=dict)
+
+
 class ModelerToCoder(BaseModel):
     questions_solution: dict[str, str]
+    question_model_docs: dict[str, QuestionModelPlan] = Field(default_factory=dict)
 
 
 class CoderToWriter(BaseModel):

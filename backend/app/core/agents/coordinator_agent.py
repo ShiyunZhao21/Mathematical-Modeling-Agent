@@ -1,10 +1,10 @@
 from app.core.agents.agent import Agent
-from app.core.llm.llm import LLM
-from app.core.prompts import COORDINATOR_PROMPT
+from app.core.llm.llm import LLM, simple_chat
+from app.core.prompts import COORDINATOR_PROMPT, MASTER_ANALYSIS_PROMPT
 import json
 import re
 from app.utils.log_util import logger
-from app.schemas.A2A import CoordinatorToModeler
+from app.schemas.A2A import CoordinatorToModeler, ProblemAnalysis, ProblemDigest
 
 
 class CoordinatorAgent(Agent):
@@ -33,7 +33,6 @@ class CoordinatorAgent(Agent):
                 )
                 json_str = response.choices[0].message.content
 
-                # 清理 JSON 字符串
                 json_str = json_str.replace("```json", "").replace("```", "").strip()
                 json_str = re.sub(r"[\x00-\x1F\x7F]", "", json_str)
 
@@ -44,21 +43,61 @@ class CoordinatorAgent(Agent):
                 ques_count = questions["ques_count"]
                 logger.info(f"questions:{questions}")
                 return CoordinatorToModeler(questions=questions, ques_count=ques_count)
-                
+
             except (json.JSONDecodeError, ValueError, KeyError) as e:
                 attempt += 1
                 logger.warning(f"解析失败 (尝试 {attempt}/{max_retries}): {str(e)}")
-                
+
                 if attempt > max_retries:
-                    logger.error(f"超过最大重试次数，放弃解析")
+                    logger.error("超过最大重试次数，放弃解析")
                     raise RuntimeError(f"无法解析模型响应: {str(e)}")
-                    
-                # 添加错误反馈提示
+
                 error_prompt = f"⚠️ 上次响应格式错误: {str(e)}。请严格输出JSON格式"
-                await self.append_chat_history({
-                    "role": "system", 
-                    "content": self.system_prompt + "\n" + error_prompt
-                })
-        
-        # 永远不会执行到这里
+                await self.append_chat_history(
+                    {
+                        "role": "system",
+                        "content": self.system_prompt + "\n" + error_prompt,
+                    }
+                )
+
         raise RuntimeError("意外的流程终止")
+
+    def build_problem_digest(
+        self,
+        coordinator_to_modeler: CoordinatorToModeler,
+        files_summary: list[str] | None = None,
+        research_summary: str = "",
+    ) -> ProblemDigest:
+        questions = coordinator_to_modeler.questions
+        conditions = [
+            value
+            for key, value in questions.items()
+            if key not in {"title", "background", "ques_count"}
+            and not str(key).startswith("ques")
+        ]
+        normalized_questions = {
+            key: value
+            for key, value in questions.items()
+            if str(key).startswith("ques") and key != "ques_count"
+        }
+        return ProblemDigest(
+            title=questions.get("title", ""),
+            background=questions.get("background", ""),
+            conditions=[str(item) for item in conditions],
+            questions={key: str(value) for key, value in normalized_questions.items()},
+            files_summary=files_summary or [],
+            research_summary=research_summary,
+        )
+
+    async def analyze_problem_links(self, problem_digest: ProblemDigest) -> ProblemAnalysis:
+        history = [
+            {"role": "system", "content": MASTER_ANALYSIS_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(problem_digest.model_dump(mode="json"), ensure_ascii=False),
+            },
+        ]
+        raw_content = await simple_chat(self.model, history)
+        cleaned = raw_content.replace("```json", "").replace("```", "").strip()
+        payload = json.loads(cleaned)
+        return ProblemAnalysis(**payload)
