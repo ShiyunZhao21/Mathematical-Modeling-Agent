@@ -22,6 +22,25 @@ class ProblemAnalysis(BaseModel):
     per_question_guidance: dict[str, str] = Field(default_factory=dict)
 
 
+class RequiredFigure(BaseModel):
+    figure_id: str
+    filename: str
+    purpose: str = ""
+    section_hint: str = ""
+    caption_hint: str = ""
+    required: bool = True
+
+
+class GeneratedFigure(BaseModel):
+    figure_id: str
+    filename: str
+    purpose: str = ""
+    section_hint: str = ""
+    caption_hint: str = ""
+    required: bool = False
+    generated: bool = True
+
+
 class QuestionModelPlan(BaseModel):
     question_key: str
     goal: str = ""
@@ -34,6 +53,7 @@ class QuestionModelPlan(BaseModel):
     formula_spec: str = ""
     coder_prompt: str = ""
     writer_context: str = ""
+    required_figures: list[RequiredFigure] = Field(default_factory=list)
     plan_markdown: str = ""
 
 
@@ -53,6 +73,7 @@ class CoderToWriter(BaseModel):
     code_response: str | None = None
     code_output: str | None = None
     created_images: list[str] | None = None
+    generated_figures: list[GeneratedFigure] | None = None
 
 
 class WriterResponse(BaseModel):

@@ -36,16 +36,21 @@ class Flows:
             key: {
                 "coder_prompt": modeler_response.question_model_docs.get(key, QuestionModelPlan(question_key=key)).coder_prompt
                 or f"参考建模手给出的解决方案{solutions.get(key, '')}\n完成如下问题{value}",
+                "required_figures": modeler_response.question_model_docs.get(
+                    key, QuestionModelPlan(question_key=key)
+                ).required_figures,
             }
             for key, value in questions_quesx.items()
         }
         flows = {
             "eda": {
                 "coder_prompt": f"参考建模手给出的解决方案{solutions.get('eda', '对数据进行探索性分析')}\n对当前目录下数据进行EDA分析(数据清洗,可视化),清洗后的数据保存当前目录下,**不需要复杂的模型**",
+                "required_figures": [],
             },
             **ques_flow,
             "sensitivity_analysis": {
                 "coder_prompt": f"参考建模手给出的解决方案{solutions.get('sensitivity_analysis', '对模型进行灵敏度分析')}\n完成敏感性分析",
+                "required_figures": [],
             },
         }
         return flows

@@ -248,7 +248,9 @@ class MathModelWorkFlow(WorkFlow):
                     f"代码手开始求解 {key}",
                 )
                 coder_response = await coder_agent.run(
-                    prompt=value["coder_prompt"], subtask_title=key
+                    prompt=value["coder_prompt"],
+                    subtask_title=key,
+                    required_figures=value.get("required_figures"),
                 )
                 await task_store.publish_message(
                     self.task_id,
@@ -275,6 +277,8 @@ class MathModelWorkFlow(WorkFlow):
                 writer_response = await writer_agent.run(
                     writer_prompt,
                     available_images=coder_response.created_images,
+                    required_figures=question_plan.required_figures if question_plan else [],
+                    generated_figures=coder_response.generated_figures,
                     sub_title=key,
                 )
                 user_output.set_res(key, writer_response)

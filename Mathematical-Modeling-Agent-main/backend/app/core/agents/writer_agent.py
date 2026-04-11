@@ -9,7 +9,7 @@ from app.schemas.response import SystemMessage
 import json
 from app.core.functions import writer_tools
 from icecream import ic
-from app.schemas.A2A import WriterResponse
+from app.schemas.A2A import GeneratedFigure, RequiredFigure, WriterResponse
 import os
 import re
 
@@ -40,11 +40,96 @@ class WriterAgent(Agent):  # 同样继承自Agent类
         self.is_first_run = True
         self.system_prompt = get_writer_prompt(format_output)
         self.available_images: list[str] = []
+        self.allowed_images: list[str] = []
+        self.required_images: list[str] = []
+        self.required_figures: list[RequiredFigure] = []
+        self.generated_figures: list[GeneratedFigure] = []
+        self.missing_required_generation: list[str] = []
         self.work_dir = work_dir
 
     @staticmethod
     def _normalize_image_name(image_path: str) -> str:
         return os.path.basename((image_path or "").strip())
+
+    @classmethod
+    def _normalize_required_figures(
+        cls, required_figures: list[RequiredFigure] | list[dict] | None
+    ) -> list[RequiredFigure]:
+        normalized: list[RequiredFigure] = []
+        for figure in required_figures or []:
+            try:
+                figure_obj = figure if isinstance(figure, RequiredFigure) else RequiredFigure(**figure)
+            except Exception:
+                continue
+            figure_obj.filename = cls._normalize_image_name(figure_obj.filename)
+            if not figure_obj.filename:
+                continue
+            normalized.append(figure_obj)
+        return normalized
+
+    @classmethod
+    def _normalize_generated_figures(
+        cls, generated_figures: list[GeneratedFigure] | list[dict] | None
+    ) -> list[GeneratedFigure]:
+        normalized: list[GeneratedFigure] = []
+        for figure in generated_figures or []:
+            try:
+                figure_obj = figure if isinstance(figure, GeneratedFigure) else GeneratedFigure(**figure)
+            except Exception:
+                continue
+            figure_obj.filename = cls._normalize_image_name(figure_obj.filename)
+            if not figure_obj.filename:
+                continue
+            normalized.append(figure_obj)
+        return normalized
+
+    @classmethod
+    def _dedupe_image_names(cls, images: list[str] | None) -> list[str]:
+        deduped: list[str] = []
+        for image in images or []:
+            normalized = cls._normalize_image_name(image)
+            if normalized and normalized not in deduped:
+                deduped.append(normalized)
+        return deduped
+
+    @classmethod
+    def _build_image_contract(
+        cls,
+        available_images: list[str] | None,
+        required_figures: list[RequiredFigure] | list[dict] | None,
+        generated_figures: list[GeneratedFigure] | list[dict] | None,
+    ) -> tuple[list[str], list[str], list[str]]:
+        normalized_required_figures = cls._normalize_required_figures(required_figures)
+        normalized_generated_figures = cls._normalize_generated_figures(generated_figures)
+
+        if normalized_generated_figures:
+            allowed_images = cls._dedupe_image_names(
+                [figure.filename for figure in normalized_generated_figures if figure.generated]
+            )
+            required_images = cls._dedupe_image_names(
+                [
+                    figure.filename
+                    for figure in normalized_generated_figures
+                    if figure.required and figure.generated
+                ]
+            )
+            missing_required_generation = cls._dedupe_image_names(
+                [
+                    figure.filename
+                    for figure in normalized_required_figures
+                    if figure.required and figure.filename not in required_images
+                ]
+            )
+            return allowed_images, required_images, missing_required_generation
+
+        fallback_images = cls._dedupe_image_names(available_images)
+        if fallback_images:
+            return fallback_images, fallback_images, []
+
+        required_images = cls._dedupe_image_names(
+            [figure.filename for figure in normalized_required_figures if figure.required]
+        )
+        return required_images, required_images, []
 
     @classmethod
     def _extract_inserted_images(cls, content: str) -> set[str]:
@@ -114,9 +199,20 @@ class WriterAgent(Agent):  # 同样继承自Agent类
         tool_choice,
         sub_title: str | None,
     ) -> str:
+        if not self.allowed_images:
+            self.allowed_images = self._dedupe_image_names(self.available_images)
+        if not self.required_images:
+            self.required_images = list(self.allowed_images)
+
+        if self.missing_required_generation:
+            raise ValueError(
+                "Writer 硬校验失败：代码手未交付必需图片: "
+                f"{self.missing_required_generation}"
+            )
+
         actual_images = self._get_actual_image_files()
         missing_on_disk = self._find_missing_images_on_disk(
-            self.available_images,
+            self.allowed_images,
             actual_images,
         )
         if missing_on_disk:
@@ -124,8 +220,10 @@ class WriterAgent(Agent):  # 同样继承自Agent类
                 f"Writer 硬校验失败：代码手声明的图片文件不存在于工作目录: {missing_on_disk}"
             )
 
-        missing_images = self._find_missing_images(response_content, self.available_images)
-        invalid_images = self._find_invalid_image_references(response_content, actual_images)
+        missing_images = self._find_missing_images(response_content, self.required_images)
+        invalid_images = self._find_invalid_image_references(
+            response_content, set(self.allowed_images)
+        )
         attempt = 0
 
         while (missing_images or invalid_images) and attempt < self.IMAGE_REWRITE_MAX_ATTEMPTS:
@@ -136,11 +234,11 @@ class WriterAgent(Agent):  # 同样继承自Agent类
             prompt_lines = [
                 "你刚才的章节图片引用未通过系统硬校验。请保留现有有效内容，并重新输出完整修订稿。",
                 "必须满足以下要求：",
-                f"1. 只能使用工作目录中真实存在的图片文件名：{', '.join(sorted(actual_images)) or '无'}",
+                f"1. 只能使用当前章节图片清单中的文件名：{', '.join(self.allowed_images) or '无'}",
             ]
-            if self.available_images:
+            if self.required_images:
                 prompt_lines.append(
-                    f"2. 当前章节必须插入以下图片：{', '.join(self.available_images)}"
+                    f"2. 当前章节必须插入以下图片：{', '.join(self.required_images)}"
                 )
             if missing_images:
                 prompt_lines.append(
@@ -168,8 +266,10 @@ class WriterAgent(Agent):  # 同样继承自Agent类
                 sub_title=sub_title,
             )
             response_content = retry_response.choices[0].message.content
-            missing_images = self._find_missing_images(response_content, self.available_images)
-            invalid_images = self._find_invalid_image_references(response_content, actual_images)
+            missing_images = self._find_missing_images(response_content, self.required_images)
+            invalid_images = self._find_invalid_image_references(
+                response_content, set(self.allowed_images)
+            )
             attempt += 1
 
         if missing_images or invalid_images:
@@ -185,6 +285,8 @@ class WriterAgent(Agent):  # 同样继承自Agent类
         self,
         prompt: str,
         available_images: list[str] = None,
+        required_figures: list[RequiredFigure] | list[dict] | None = None,
+        generated_figures: list[GeneratedFigure] | list[dict] | None = None,
         sub_title: str = None,
     ) -> WriterResponse:
         """
@@ -192,6 +294,8 @@ class WriterAgent(Agent):  # 同样继承自Agent类
         Args:
             prompt: 写作提示
             available_images: 可用的图片相对路径列表（如 20250420-173744-9f87792c/编号_分布.png）
+            required_figures: 建模手定义的结构化图片清单
+            generated_figures: 代码手实际交付的结构化图片清单
             sub_title: 子任务标题
         """
         logger.info(f"subtitle是:{sub_title}")
@@ -202,16 +306,58 @@ class WriterAgent(Agent):  # 同样继承自Agent类
                 {"role": "system", "content": self.system_prompt}
             )
 
-        self.available_images = available_images or []
+        self.available_images = self._dedupe_image_names(available_images)
+        self.required_figures = self._normalize_required_figures(required_figures)
+        self.generated_figures = self._normalize_generated_figures(generated_figures)
+        (
+            self.allowed_images,
+            self.required_images,
+            self.missing_required_generation,
+        ) = self._build_image_contract(
+            available_images=self.available_images,
+            required_figures=self.required_figures,
+            generated_figures=self.generated_figures,
+        )
 
-        if self.available_images:
+        if self.missing_required_generation:
+            raise ValueError(
+                "Writer 硬校验失败：代码手未交付必需图片: "
+                f"{self.missing_required_generation}"
+            )
+
+        if self.generated_figures:
+            image_lines = []
+            for figure in self.generated_figures:
+                if not figure.generated:
+                    continue
+                requirement = "必须插入" if figure.required else "可选插入"
+                detail = [f"- {requirement}: ![{figure.caption_hint or figure.filename}]({figure.filename})"]
+                if figure.purpose:
+                    detail.append(f"用途={figure.purpose}")
+                if figure.section_hint:
+                    detail.append(f"建议位置={figure.section_hint}")
+                image_lines.append("；".join(detail))
+            image_prompt = (
+                f"\n\n【本章节结构化图片清单】\n"
+                f"以下清单是当前章节唯一允许引用的图片文件名，请严格按清单写作，不要自行发明新图名：\n"
+                f"{chr(10).join(image_lines) if image_lines else '无'}\n"
+                f"必须插入的图片文件名：{', '.join(self.required_images) or '无'}\n"
+                f"注意：当前 prompt 上文中如果出现“相关性热力图”“ROC曲线”“残差分析图”“特征重要性图”等描述性名称，它们只是图的语义描述，不是文件名。\n"
+                f"如果 prose 里的描述性名称与本清单冲突，永远以本清单为准；不得根据 prose 自行拼接或翻译出新的图片文件名。\n"
+                f"只允许使用以上文件名，禁止引用工作目录中的其他图片，也禁止虚构 fig1_xxx.png、image.png、chart.png 等不存在文件。\n"
+                f"插入格式为独占一行的 ![描述](文件名)，每张必需图片前后需配3行以上的分析解读。\n"
+            )
+            logger.info(f"image_prompt是:{image_prompt}")
+            prompt = prompt + image_prompt
+        elif self.allowed_images:
             image_lines = "\n".join(
-                [f"- ![{img}]({img})" for img in self.available_images]
+                [f"- ![{img}]({img})" for img in self.allowed_images]
             )
             image_prompt = (
                 f"\n\n【必须插入的图片列表】\n"
                 f"以下图片是工作目录中真实存在、且由代码手生成的文件，你必须在论文相关段落后用 Markdown 格式逐一插入：\n"
                 f"{image_lines}\n"
+                f"注意：上文里出现的任何“热力图”“ROC曲线”“残差分析图”等描述性名称都只是语义说明，不是文件名；文件名只能从下面这份列表中选择。\n"
                 f"只能使用上面这些真实文件名，禁止虚构 fig1_xxx.png、image.png、chart.png 等不存在文件。\n"
                 f"插入格式为独占一行的 ![描述](文件名)，每张图片后需配3行以上的分析解读。\n"
             )

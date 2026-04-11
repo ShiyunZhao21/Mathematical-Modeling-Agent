@@ -5,10 +5,11 @@ from app.services.redis_manager import redis_manager
 from app.schemas.response import SystemMessage, InterpreterMessage
 from app.tools.base_interpreter import BaseCodeInterpreter
 from app.core.llm.llm import LLM
-from app.schemas.A2A import CoderToWriter
+from app.schemas.A2A import CoderToWriter, GeneratedFigure, RequiredFigure
 from app.core.prompts import CODER_PROMPT
 from app.utils.common_utils import get_current_files
 import json
+import os
 from app.core.prompts import get_reflection_prompt
 from app.core.functions import coder_tools
 
@@ -31,9 +32,10 @@ class CoderAgent(Agent):  # 同样继承自Agent类
         work_dir: str,  # 工作目录
         max_chat_turns: int = settings.MAX_CHAT_TURNS,  # 最大聊天次数
         max_retries: int = settings.MAX_RETRIES,  # 最大反思次数
+        max_memory: int = 24,  # 最大记忆轮次
         code_interpreter: BaseCodeInterpreter = None,
     ) -> None:
-        super().__init__(task_id, model, max_chat_turns)
+        super().__init__(task_id, model, max_chat_turns, max_memory)
         self.work_dir = work_dir
         self.max_retries = max_retries
         self.is_first_run = True
@@ -49,6 +51,138 @@ class CoderAgent(Agent):  # 同样继承自Agent类
     @staticmethod
     def _format_image_list(images: list[str]) -> str:
         return ", ".join(images) if images else "无"
+
+    @staticmethod
+    def _normalize_image_name(image_name: str) -> str:
+        return os.path.basename((image_name or "").strip())
+
+    @classmethod
+    def _normalize_required_figures(
+        cls, required_figures: list[RequiredFigure] | list[dict] | None
+    ) -> list[RequiredFigure]:
+        normalized: list[RequiredFigure] = []
+        for figure in required_figures or []:
+            try:
+                figure_obj = figure if isinstance(figure, RequiredFigure) else RequiredFigure(**figure)
+            except Exception:
+                continue
+            figure_obj.filename = cls._normalize_image_name(figure_obj.filename)
+            if not figure_obj.filename:
+                continue
+            normalized.append(figure_obj)
+        return normalized
+
+    @classmethod
+    def _get_required_filenames(
+        cls, required_figures: list[RequiredFigure] | list[dict] | None
+    ) -> list[str]:
+        filenames: list[str] = []
+        for figure in cls._normalize_required_figures(required_figures):
+            if not figure.required:
+                continue
+            if figure.filename not in filenames:
+                filenames.append(figure.filename)
+        return filenames
+
+    @classmethod
+    def _find_missing_required_images(
+        cls,
+        created_images: list[str],
+        required_figures: list[RequiredFigure] | list[dict] | None,
+    ) -> list[str]:
+        created = {
+            cls._normalize_image_name(image)
+            for image in created_images or []
+            if cls._normalize_image_name(image)
+        }
+        return [
+            filename
+            for filename in cls._get_required_filenames(required_figures)
+            if filename not in created
+        ]
+
+    @classmethod
+    def _build_generated_figures_manifest(
+        cls,
+        required_figures: list[RequiredFigure] | list[dict] | None,
+        created_images: list[str],
+    ) -> list[GeneratedFigure]:
+        normalized_required_figures = cls._normalize_required_figures(required_figures)
+        created = []
+        created_set = set()
+        for image in created_images or []:
+            normalized = cls._normalize_image_name(image)
+            if normalized and normalized not in created_set:
+                created.append(normalized)
+                created_set.add(normalized)
+
+        manifest: list[GeneratedFigure] = []
+        seen_filenames: set[str] = set()
+
+        for figure in normalized_required_figures:
+            manifest.append(
+                GeneratedFigure(
+                    figure_id=figure.figure_id,
+                    filename=figure.filename,
+                    purpose=figure.purpose,
+                    section_hint=figure.section_hint,
+                    caption_hint=figure.caption_hint,
+                    required=figure.required,
+                    generated=figure.filename in created_set,
+                )
+            )
+            seen_filenames.add(figure.filename)
+
+        for image_name in created:
+            if image_name in seen_filenames:
+                continue
+            figure_id = os.path.splitext(image_name)[0]
+            manifest.append(
+                GeneratedFigure(
+                    figure_id=figure_id,
+                    filename=image_name,
+                    generated=True,
+                )
+            )
+            seen_filenames.add(image_name)
+
+        return manifest
+
+    def _build_required_figures_prompt(
+        self,
+        subtask_title: str,
+        required_figures: list[RequiredFigure] | list[dict] | None,
+    ) -> str:
+        figures = self._normalize_required_figures(required_figures)
+        if not figures:
+            return ""
+
+        lines = [
+            "【本题图片交付清单】",
+            f"当前章节: {subtask_title}",
+            "你必须严格按以下清单生成论文主图，文件名必须完全一致：",
+        ]
+        for index, figure in enumerate(figures, start=1):
+            requirement = "必须生成" if figure.required else "可选补充"
+            detail_parts = [
+                f"{index}. {requirement}: {figure.filename}",
+                f"figure_id={figure.figure_id}",
+            ]
+            if figure.purpose:
+                detail_parts.append(f"用途={figure.purpose}")
+            if figure.section_hint:
+                detail_parts.append(f"插入位置={figure.section_hint}")
+            if figure.caption_hint:
+                detail_parts.append(f"图注提示={figure.caption_hint}")
+            lines.append("；".join(detail_parts))
+        lines.extend(
+            [
+                "禁止自创新的论文主图文件名，也不要把这些图保存成 step0_xxx、fig1.png、image.png、plot.png 之类的临时名字。",
+                "每张图保存后，继续按既有规范打印关键数据特征。",
+                "最终总结时，请明确列出已经生成的图片文件名，并与上面的清单逐一对应。",
+            ]
+        )
+        return "\n".join(lines)
 
     def _build_image_completion_prompt(
         self,
@@ -73,9 +207,67 @@ class CoderAgent(Agent):  # 同样继承自Agent类
             "6. 完成后请明确总结所有图片文件名，再结束。"
         )
 
-    async def run(self, prompt: str, subtask_title: str) -> CoderToWriter:
+    def _build_required_figure_completion_prompt(
+        self,
+        subtask_title: str,
+        created_images: list[str],
+        required_figures: list[RequiredFigure] | list[dict] | None,
+        missing_required_images: list[str],
+    ) -> str:
+        figures = self._normalize_required_figures(required_figures)
+        lines = [
+            "系统校验发现当前子任务缺少建模手指定的必需图片，请补齐这些图片，不要重写已有分析。",
+            f"当前章节: {subtask_title}",
+            f"当前已有图片({len(created_images)}张): {self._format_image_list(created_images)}",
+            f"缺少的必需图片: {self._format_image_list(missing_required_images)}",
+            "必须满足以下要求：",
+            "1. 新补充的图片必须保存到当前工作目录，文件名与缺失清单完全一致。",
+            "2. 不要把图片保存成 step0_xxx、fig1.png、image.png、plot.png 等临时名字。",
+            "3. 已经生成正确文件名的图片不要改名重做，优先补齐缺失项。",
+            "4. 每张补充图片保存后，必须立刻用 print() 输出图中关键数据特征。",
+            "5. 完成后请明确列出全部已生成图片文件名，再结束。",
+        ]
+        if figures:
+            lines.append("参考图片清单如下：")
+            for figure in figures:
+                requirement = "必须生成" if figure.required else "可选补充"
+                detail = [f"- {requirement}: {figure.filename}"]
+                if figure.purpose:
+                    detail.append(f"用途={figure.purpose}")
+                if figure.caption_hint:
+                    detail.append(f"图注提示={figure.caption_hint}")
+                lines.append("；".join(detail))
+        return "\n".join(lines)
+
+    async def _build_terminal_result(
+        self,
+        subtask_title: str,
+        required_figures: list[RequiredFigure] | list[dict] | None,
+        fallback_message: str,
+        preferred_response: str | None = None,
+    ) -> CoderToWriter:
+        created_images = await self.code_interpreter.get_created_images(subtask_title)
+        response_text = preferred_response or fallback_message
+        return CoderToWriter(
+            code_response=response_text,
+            code_output=self.code_interpreter.get_code_output(subtask_title),
+            created_images=created_images,
+            generated_figures=self._build_generated_figures_manifest(
+                required_figures,
+                created_images,
+            ),
+        )
+
+    async def run(
+        self,
+        prompt: str,
+        subtask_title: str,
+        required_figures: list[RequiredFigure] | list[dict] | None = None,
+    ) -> CoderToWriter:
         logger.info(f"{self.__class__.__name__}:开始:执行子任务: {subtask_title}")
         self.code_interpreter.add_section(subtask_title)
+        normalized_required_figures = self._normalize_required_figures(required_figures)
+        required_filenames = self._get_required_filenames(normalized_required_figures)
 
         # 如果是第一次运行，则添加系统提示
         if self.is_first_run:
@@ -93,11 +285,19 @@ class CoderAgent(Agent):  # 同样继承自Agent类
             )
 
         # 添加 sub_task
-        logger.info(f"添加子任务提示: {prompt}")
-        await self.append_chat_history({"role": "user", "content": prompt})
+        prompt_parts = [prompt]
+        required_figures_prompt = self._build_required_figures_prompt(
+            subtask_title, normalized_required_figures
+        )
+        if required_figures_prompt:
+            prompt_parts.append(required_figures_prompt)
+        task_prompt = "\n\n".join(part for part in prompt_parts if part)
+        logger.info(f"添加子任务提示: {task_prompt}")
+        await self.append_chat_history({"role": "user", "content": task_prompt})
 
         retry_count = 0
         last_error_message = ""
+        last_successful_response: str | None = None
 
         while True:
             if retry_count >= self.max_retries:
@@ -107,10 +307,15 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                     SystemMessage(content="超过最大尝试次数", type="error"),
                 )
                 logger.warning(f"任务失败，超过最大尝试次数{self.max_retries}, 最后错误信息: {last_error_message}")
-                return CoderToWriter(
-                    code_response=f"任务失败，超过最大尝试次数{self.max_retries}, 最后错误信息: {last_error_message}",
-                    code_output=self.code_interpreter.get_code_output(subtask_title),
-                    created_images=[])
+                return await self._build_terminal_result(
+                    subtask_title=subtask_title,
+                    required_figures=normalized_required_figures,
+                    fallback_message=(
+                        f"任务失败，超过最大尝试次数{self.max_retries}, "
+                        f"最后错误信息: {last_error_message}"
+                    ),
+                    preferred_response=last_successful_response,
+                )
                 
 
             if self.current_chat_turns >= self.max_chat_turns:
@@ -218,10 +423,55 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                     # 没有工具调用，表示任务完成
                     logger.info("没有工具调用，任务完成")
                     response_content = response.choices[0].message.content
+                    if response_content:
+                        last_successful_response = response_content
                     created_images = await self.code_interpreter.get_created_images(
                         subtask_title
                     )
-                    min_expected_images = self._get_min_expected_images(subtask_title)
+                    missing_required_images = self._find_missing_required_images(
+                        created_images,
+                        normalized_required_figures,
+                    )
+                    # 当建模手已经给出结构化必需图片清单时，优先遵守该清单；
+                    # 通用的最少图片数仅作为没有明确清单时的兜底规则。
+                    min_expected_images = (
+                        len(required_filenames)
+                        if required_filenames
+                        else self._get_min_expected_images(subtask_title)
+                    )
+
+                    if missing_required_images:
+                        logger.warning(
+                            f"{subtask_title} 缺少必需图片: {missing_required_images}"
+                        )
+                        retry_count += 1
+                        last_error_message = (
+                            f"{subtask_title} 缺少必需图片："
+                            f"{self._format_image_list(missing_required_images)}"
+                        )
+                        await redis_manager.publish_message(
+                            self.task_id,
+                            SystemMessage(
+                                content=f"代码手正在补齐 {subtask_title} 必需图表",
+                                type="error",
+                            ),
+                        )
+                        if response_content:
+                            await self.append_chat_history(
+                                {"role": "assistant", "content": response_content}
+                            )
+                        await self.append_chat_history(
+                            {
+                                "role": "user",
+                                "content": self._build_required_figure_completion_prompt(
+                                    subtask_title=subtask_title,
+                                    created_images=created_images,
+                                    required_figures=normalized_required_figures,
+                                    missing_required_images=missing_required_images,
+                                ),
+                            }
+                        )
+                        continue
 
                     if len(created_images) < min_expected_images:
                         logger.warning(
@@ -255,10 +505,11 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                         )
                         continue
 
-                    return CoderToWriter(
-                        code_response=response_content,
-                        code_output=self.code_interpreter.get_code_output(subtask_title),
-                        created_images=created_images,
+                    return await self._build_terminal_result(
+                        subtask_title=subtask_title,
+                        required_figures=normalized_required_figures,
+                        fallback_message=response_content or "",
+                        preferred_response=response_content,
                     )
                     
             except Exception as e:
