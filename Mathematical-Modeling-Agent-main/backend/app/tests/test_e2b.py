@@ -6,6 +6,7 @@ import unittest
 from dotenv import load_dotenv
 
 from app.tools.e2b_interpreter import E2BCodeInterpreter
+from app.tools.notebook_serializer import NotebookSerializer
 from app.utils.common_utils import create_work_dir
 
 try:
@@ -28,8 +29,9 @@ class TestE2BCodeInterpreter(unittest.TestCase):
 
         if E2BCodeInterpreter is None:
             self.skipTest("e2b_code_interpreter not available")
-        _, dirs = create_work_dir("20250312-104132-d3625cab")
-        notebook = NotebookSerializer(dirs["jupyter"])
+        self.task_id = "20250312-104132-d3625cab"
+        self.work_dir = create_work_dir(self.task_id)
+        notebook = NotebookSerializer(work_dir=self.work_dir)
 
         self.code_interpreter = E2BCodeInterpreter(
             self.task_id, self.work_dir, notebook

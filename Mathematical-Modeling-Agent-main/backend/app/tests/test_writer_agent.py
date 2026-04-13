@@ -194,6 +194,64 @@ class TestWriterAgentImageValidation(unittest.TestCase):
                 )
             )
 
+    def test_reconcile_contract_with_disk_recovers_required_images_present_on_disk(self):
+        tmp_dir = _make_tmp_dir()
+        open(os.path.join(tmp_dir, "ques4_cluster_profiles.png"), "wb").close()
+        open(os.path.join(tmp_dir, "ques4_feature_importance.png"), "wb").close()
+
+        writer = WriterAgent(
+            task_id="test",
+            model=_FakeModel(["正文分析\n\n![图1](ques4_cluster_profiles.png)\n\n补充分析\n\n![图2](ques4_feature_importance.png)"]),
+            work_dir=tmp_dir,
+        )
+        writer.required_figures = [
+            RequiredFigure(
+                figure_id="ques4_cluster_profiles",
+                filename="ques4_cluster_profiles.png",
+                purpose="聚类画像",
+            ),
+            RequiredFigure(
+                figure_id="ques4_feature_importance",
+                filename="ques4_feature_importance.png",
+                purpose="特征重要性",
+            ),
+        ]
+        writer.generated_figures = [
+            GeneratedFigure(
+                figure_id="ques4_cluster_profiles",
+                filename="ques4_cluster_profiles.png",
+                purpose="聚类画像",
+                required=True,
+                generated=False,
+            ),
+            GeneratedFigure(
+                figure_id="ques4_feature_importance",
+                filename="ques4_feature_importance.png",
+                purpose="特征重要性",
+                required=True,
+                generated=False,
+            ),
+        ]
+        writer.allowed_images, writer.required_images, writer.missing_required_generation = (
+            writer._build_image_contract(
+                available_images=[],
+                required_figures=writer.required_figures,
+                generated_figures=writer.generated_figures,
+            )
+        )
+
+        writer._reconcile_contract_with_disk()
+
+        self.assertEqual(writer.missing_required_generation, [])
+        self.assertEqual(
+            writer.required_images,
+            ["ques4_cluster_profiles.png", "ques4_feature_importance.png"],
+        )
+        self.assertEqual(
+            writer.allowed_images,
+            ["ques4_cluster_profiles.png", "ques4_feature_importance.png"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

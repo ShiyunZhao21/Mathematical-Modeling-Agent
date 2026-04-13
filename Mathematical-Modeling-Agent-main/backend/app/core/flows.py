@@ -1,6 +1,12 @@
 from app.models.user_output import UserOutput
 from app.tools.base_interpreter import BaseCodeInterpreter
-from app.schemas.A2A import ModelerToCoder, ProblemAnalysis, ProblemDigest, QuestionModelPlan
+from app.schemas.A2A import (
+    GeneratedFigure,
+    ModelerToCoder,
+    ProblemAnalysis,
+    ProblemDigest,
+    QuestionModelPlan,
+)
 
 
 class Flows:
@@ -78,6 +84,58 @@ class Flows:
         }
         return flows
 
+    def _build_writer_asset_contract(
+        self,
+        key: str,
+        available_images: list[str] | None,
+        generated_figures: list[GeneratedFigure] | list[dict] | None,
+    ) -> str:
+        normalized_images = []
+        seen_images: set[str] = set()
+        for image in available_images or []:
+            normalized = (image or "").strip()
+            if normalized and normalized not in seen_images:
+                seen_images.add(normalized)
+                normalized_images.append(normalized)
+
+        generated_lines: list[str] = []
+        required_images: list[str] = []
+        for figure in generated_figures or []:
+            figure_obj = figure if isinstance(figure, GeneratedFigure) else GeneratedFigure(**figure)
+            if not figure_obj.generated:
+                continue
+            if figure_obj.filename and figure_obj.filename not in seen_images:
+                seen_images.add(figure_obj.filename)
+                normalized_images.append(figure_obj.filename)
+            if figure_obj.required and figure_obj.filename and figure_obj.filename not in required_images:
+                required_images.append(figure_obj.filename)
+            details = [f"文件名={figure_obj.filename}"]
+            if figure_obj.required:
+                details.append("要求=必须插入")
+            else:
+                details.append("要求=可选插入")
+            if figure_obj.purpose:
+                details.append(f"用途={figure_obj.purpose}")
+            if figure_obj.section_hint:
+                details.append(f"建议位置={figure_obj.section_hint}")
+            if figure_obj.caption_hint:
+                details.append(f"图注提示={figure_obj.caption_hint}")
+            generated_lines.append("- " + "；".join(details))
+
+        contract_lines = [
+            "【章节资产合同】",
+            f"当前章节={key}",
+            f"唯一允许引用的图片文件名={', '.join(normalized_images) if normalized_images else '无'}",
+            f"必须插入的图片文件名={', '.join(required_images) if required_images else '无'}",
+            "规则：文件名只认本合同，不认上下文中的描述性图名；若 prose 与本合同冲突，永远以本合同为准。",
+            "规则：禁止把“热力图”“残差图”“ROC曲线”等语义描述改写成新的文件名。",
+            "规则：禁止引用未出现在本合同中的其他图片，也禁止编造 fig1.png、image.png、chart.png 等名字。",
+        ]
+        if generated_lines:
+            contract_lines.append("结构化交付清单：")
+            contract_lines.extend(generated_lines)
+        return "\n".join(contract_lines)
+
     def get_writer_prompt(
         self,
         key: str,
@@ -88,25 +146,41 @@ class Flows:
         problem_digest: ProblemDigest | None = None,
         problem_analysis: ProblemAnalysis | None = None,
         conclusion_memory_markdown: str = "",
+        available_images: list[str] | None = None,
+        generated_figures: list[GeneratedFigure] | list[dict] | None = None,
     ) -> str:
         code_output = code_interpreter.get_code_output(key)
-        questions_quesx_keys = self.get_questions_quesx_keys()
         bgc = problem_digest.background if problem_digest else self.questions.get("background", "")
         overall_analysis = problem_analysis.overall_analysis if problem_analysis else ""
         question_context = question_plan.writer_context if question_plan else ""
-        quesx_writer_prompt = {
-            item_key: f"问题背景{bgc}；整体分析{overall_analysis}；结论库{conclusion_memory_markdown}；当前问题文档3上下文{question_context}；代码手得到的结果{coder_response},{code_output}，按照如下模板撰写：{config_template[item_key]}"
-            for item_key in questions_quesx_keys
-        }
+        asset_contract = self._build_writer_asset_contract(
+            key=key,
+            available_images=available_images,
+            generated_figures=generated_figures,
+        )
 
-        writer_prompt = {
-            "eda": f"问题背景{bgc}，不需要编写代码，代码手得到的结果{coder_response},{code_output}，按照如下模板撰写：{config_template['eda']}",
-            **quesx_writer_prompt,
-            "sensitivity_analysis": f"问题背景{bgc}，不需要编写代码，代码手得到的结果{coder_response},{code_output}，按照如下模板撰写：{config_template['sensitivity_analysis']}",
-        }
+        if key == "eda":
+            return (
+                f"{asset_contract}\n\n问题背景{bgc}，不需要编写代码，"
+                f"代码手得到的结果{coder_response},{code_output}，"
+                f"按照如下模板撰写：{config_template['eda']}"
+            )
 
-        if key in writer_prompt:
-            return writer_prompt[key]
+        if key == "sensitivity_analysis":
+            return (
+                f"{asset_contract}\n\n问题背景{bgc}，不需要编写代码，"
+                f"代码手得到的结果{coder_response},{code_output}，"
+                f"按照如下模板撰写：{config_template['sensitivity_analysis']}"
+            )
+
+        questions_quesx_keys = self.get_questions_quesx_keys()
+        if key in questions_quesx_keys:
+            return (
+                f"{asset_contract}\n\n问题背景{bgc}；整体分析{overall_analysis}；"
+                f"结论库{conclusion_memory_markdown}；当前问题文档3上下文{question_context}；"
+                f"代码手得到的结果{coder_response},{code_output}，按照如下模板撰写：{config_template[key]}"
+            )
+
         raise ValueError(f"未知的任务类型: {key}")
 
     def get_questions_quesx_keys(self) -> list[str]:

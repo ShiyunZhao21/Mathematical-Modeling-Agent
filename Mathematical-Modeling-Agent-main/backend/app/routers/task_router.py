@@ -76,7 +76,10 @@ async def run_task(
     ques_all: str = Form(...),
     comp_template: CompTemplate = Form(default=CompTemplate.CHINA),
     format_output: FormatOutPut = Form(default=FormatOutPut.Markdown),
-    files: list[UploadFile] | None = File(default=None),
+    files: list[UploadFile] = File(
+        default_factory=list,
+        description="Optional data/problem files. Select one or more files in Swagger UI.",
+    ),
 ):
     if format_output != FormatOutPut.Markdown:
         raise HTTPException(

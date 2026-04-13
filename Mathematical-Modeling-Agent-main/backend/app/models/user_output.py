@@ -169,6 +169,13 @@ class UserOutput:
                 r"\usepackage{hyperref}",
                 r"\usepackage{xcolor}",
                 r"\usepackage{indentfirst}",
+                r"% 使用系统自带字体，避免 Noto CJK 缺失导致的 fontspec 错误",
+                r"\setmainfont{Times New Roman}",
+                r"\setsansfont{Arial}",
+                r"\setCJKmainfont{SimSun}",
+                r"\setCJKsansfont{SimHei}",
+                r"\setCJKfamilyfont{song}{SimSun}",
+                r"\setCJKfamilyfont{hei}{SimHei}",
                 r"\setlength{\parindent}{2em}",
                 r"\setlist[itemize]{leftmargin=2em}",
                 r"\setlist[enumerate]{leftmargin=2em}",
@@ -182,3 +189,4 @@ class UserOutput:
                 "",
             ]
         )
+

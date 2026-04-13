@@ -1,25 +1,24 @@
-from app.core.agents.agent import Agent
-from app.config.setting import settings
-from app.utils.log_util import logger
-from app.services.redis_manager import redis_manager
-from app.schemas.response import SystemMessage, InterpreterMessage
-from app.tools.base_interpreter import BaseCodeInterpreter
-from app.core.llm.llm import LLM
-from app.schemas.A2A import CoderToWriter, GeneratedFigure, RequiredFigure
-from app.core.prompts import CODER_PROMPT
-from app.utils.common_utils import get_current_files
+from __future__ import annotations
+
 import json
 import os
-from app.core.prompts import get_reflection_prompt
+import shutil
+from pathlib import Path
+
+from app.config.setting import settings
+from app.core.agents.agent import Agent
 from app.core.functions import coder_tools
+from app.core.llm.llm import LLM
+from app.core.prompts import CODER_PROMPT, get_reflection_prompt
+from app.schemas.A2A import CoderToWriter, GeneratedFigure, RequiredFigure
+from app.schemas.response import InterpreterMessage, SystemMessage
+from app.services.redis_manager import redis_manager
+from app.tools.base_interpreter import BaseCodeInterpreter
+from app.utils.common_utils import get_current_files
+from app.utils.log_util import logger
 
-# TODO: 时间等待过久，stop 进程
-# TODO: 支持 cuda
-# TODO: 引入创新方案：
 
-
-# 代码强
-class CoderAgent(Agent):  # 同样继承自Agent类
+class CoderAgent(Agent):
     MIN_IMAGES_BY_SECTION = {
         "eda": 2,
         "sensitivity_analysis": 2,
@@ -29,10 +28,10 @@ class CoderAgent(Agent):  # 同样继承自Agent类
         self,
         task_id: str,
         model: LLM,
-        work_dir: str,  # 工作目录
-        max_chat_turns: int = settings.MAX_CHAT_TURNS,  # 最大聊天次数
-        max_retries: int = settings.MAX_RETRIES,  # 最大反思次数
-        max_memory: int = 24,  # 最大记忆轮次
+        work_dir: str,
+        max_chat_turns: int = settings.MAX_CHAT_TURNS,
+        max_retries: int = settings.MAX_RETRIES,
+        max_memory: int = 24,
         code_interpreter: BaseCodeInterpreter = None,
     ) -> None:
         super().__init__(task_id, model, max_chat_turns, max_memory)
@@ -41,6 +40,14 @@ class CoderAgent(Agent):  # 同样继承自Agent类
         self.is_first_run = True
         self.system_prompt = CODER_PROMPT
         self.code_interpreter = code_interpreter
+
+        # ===== 全局图片大小控制：主动生成较小图片，减少触发压缩概率 =====
+        import matplotlib.pyplot as plt
+        plt.rcParams['savefig.dpi'] = 180
+        plt.rcParams['figure.dpi'] = 140
+        plt.rcParams['savefig.bbox'] = 'tight'
+        plt.rcParams['savefig.optimize'] = True
+        # ================================================================
 
     @classmethod
     def _get_min_expected_images(cls, subtask_title: str) -> int:
@@ -245,6 +252,8 @@ class CoderAgent(Agent):  # 同样继承自Agent类
         required_figures: list[RequiredFigure] | list[dict] | None,
         fallback_message: str,
         preferred_response: str | None = None,
+        status: str = "ok",
+        warnings: list[str] | None = None,
     ) -> CoderToWriter:
         created_images = await self.code_interpreter.get_created_images(subtask_title)
         response_text = preferred_response or fallback_message
@@ -256,6 +265,8 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                 required_figures,
                 created_images,
             ),
+            status=status,
+            warnings=warnings or [],
         )
 
     async def run(
@@ -269,14 +280,10 @@ class CoderAgent(Agent):  # 同样继承自Agent类
         normalized_required_figures = self._normalize_required_figures(required_figures)
         required_filenames = self._get_required_filenames(normalized_required_figures)
 
-        # 如果是第一次运行，则添加系统提示
         if self.is_first_run:
             logger.info("首次运行，添加系统提示和数据集文件信息")
             self.is_first_run = False
-            await self.append_chat_history(
-                {"role": "system", "content": self.system_prompt}
-            )
-            # 当前数据集文件
+            await self.append_chat_history({"role": "system", "content": self.system_prompt})
             await self.append_chat_history(
                 {
                     "role": "user",
@@ -284,7 +291,6 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                 }
             )
 
-        # 添加 sub_task
         prompt_parts = [prompt]
         required_figures_prompt = self._build_required_figures_prompt(
             subtask_title, normalized_required_figures
@@ -303,8 +309,7 @@ class CoderAgent(Agent):  # 同样继承自Agent类
             if retry_count >= self.max_retries:
                 logger.error(f"超过最大尝试次数: {self.max_retries}")
                 await redis_manager.publish_message(
-                    self.task_id,
-                    SystemMessage(content="超过最大尝试次数", type="error"),
+                    self.task_id, SystemMessage(content="超过最大尝试次数", type="error")
                 )
                 logger.warning(f"任务失败，超过最大尝试次数{self.max_retries}, 最后错误信息: {last_error_message}")
                 return await self._build_terminal_result(
@@ -316,30 +321,27 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                     ),
                     preferred_response=last_successful_response,
                 )
-                
 
             if self.current_chat_turns >= self.max_chat_turns:
                 logger.error(f"超过最大聊天次数: {self.max_chat_turns}")
                 await redis_manager.publish_message(
-                    self.task_id,
-                    SystemMessage(content="超过最大聊天次数", type="error"),
+                    self.task_id, SystemMessage(content="超过最大聊天次数", type="error")
                 )
-                raise Exception(
-                    f"Reached maximum number of chat turns ({self.max_chat_turns}). Task incomplete."
-                )
+                raise Exception(f"Reached maximum number of chat turns ({self.max_chat_turns}). Task incomplete.")
 
             self.current_chat_turns += 1
             logger.info(f"当前对话轮次: {self.current_chat_turns}")
-            
+
             try:
                 response = await self.model.chat(
                     history=self.chat_history,
                     tools=coder_tools,
                     tool_choice="auto",
                     agent_name=self.__class__.__name__,
+                    # FIX(subtitle=None): 传入 subtask_title 作为 sub_title，避免日志中出现 subtitle是:None
+                    sub_title=subtask_title,
                 )
 
-                # 如果有工具调用
                 if (
                     hasattr(response.choices[0].message, "tool_calls")
                     and response.choices[0].message.tool_calls
@@ -347,93 +349,89 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                     logger.info("检测到工具调用")
                     tool_call = response.choices[0].message.tool_calls[0]
                     tool_id = tool_call.id
-                    
+
                     if tool_call.function.name == "execute_code":
                         logger.info(f"调用工具: {tool_call.function.name}")
                         await redis_manager.publish_message(
                             self.task_id,
-                            SystemMessage(
-                                content=f"代码手调用{tool_call.function.name}工具"
-                            ),
+                            SystemMessage(content=f"代码手调用{tool_call.function.name}工具"),
                         )
 
-                        code = json.loads(tool_call.function.arguments)["code"]
+                        try:
+                            tool_arguments = json.loads(tool_call.function.arguments or "{}")
+                        except json.JSONDecodeError as exc:
+                            tool_arguments = {}
+                            logger.warning(f"Invalid execute_code arguments JSON: {exc}")
+
+                        code = tool_arguments.get("code")
+                        if not isinstance(code, str) or not code.strip():
+                            error_message = (
+                                "execute_code tool call did not include a non-empty `code` argument."
+                            )
+                            await self.append_chat_history(
+                                {"role": "tool", "tool_call_id": tool_id, "name": "execute_code", "content": error_message}
+                            )
+                            retry_count += 1
+                            last_error_message = error_message
+                            await self.append_chat_history(
+                                {"role": "user", "content": get_reflection_prompt(error_message, str(tool_arguments))}
+                            )
+                            continue
 
                         await redis_manager.publish_message(
-                            self.task_id,
-                            InterpreterMessage(
-                                input={"code": code},
-                            ),
+                            self.task_id, InterpreterMessage(input={"code": code})
                         )
 
-                        # 更新对话历史 - 添加助手的响应
-                        await self.append_chat_history(
-                            response.choices[0].message.model_dump()
-                        )
-                        logger.info(response.choices[0].message.model_dump())
+                        await self.append_chat_history(response.choices[0].message.model_dump())
 
-                        # 执行工具调用
                         logger.info("执行工具调用")
-                        (
-                            text_to_gpt,
-                            error_occurred,
-                            error_message,
-                        ) = await self.code_interpreter.execute_code(code)
+                        text_to_gpt, error_occurred, error_message = await self.code_interpreter.execute_code(code)
 
-                        # 添加工具执行结果
                         if error_occurred:
-                            # 即使发生错误也要添加tool响应
                             await self.append_chat_history(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_id,
-                                    "name": "execute_code",
-                                    "content": error_message,
-                                }
+                                {"role": "tool", "tool_call_id": tool_id, "name": "execute_code", "content": error_message}
                             )
-
                             logger.warning(f"代码执行错误: {error_message}")
                             retry_count += 1
-                            logger.info(f"当前尝试次:{retry_count} / {self.max_retries}")
                             last_error_message = error_message
-                            reflection_prompt = get_reflection_prompt(error_message, code)
-
                             await redis_manager.publish_message(
-                                self.task_id,
-                                SystemMessage(content="代码手反思纠正错误", type="error"),
+                                self.task_id, SystemMessage(content="代码手反思纠正错误", type="error")
                             )
-
                             await self.append_chat_history(
-                                {"role": "user", "content": reflection_prompt}
+                                {"role": "user", "content": get_reflection_prompt(error_message, code)}
                             )
                             continue
                         else:
-                            # 成功执行的tool响应
+                            # 成功执行
                             await self.append_chat_history(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_id,
-                                    "name": "execute_code",
-                                    "content": text_to_gpt,
-                                }
+                                {"role": "tool", "tool_call_id": tool_id, "name": "execute_code", "content": text_to_gpt}
                             )
-                            # 成功执行后继续循环，等待下一步指令
+
+                            # ===== FIX: 图片压缩自动修复机制 =====
+                            # 每次代码执行成功后立即检查，而不仅在最后检查
+                            # 这样即使最后一次执行触发了压缩，Writer校验前也有机会修复
+                            try:
+                                logger.info("执行图片自动修复机制（防止压缩/转格式导致文件名对不上）")
+                                await self._ensure_required_images_after_execution(
+                                    subtask_title, normalized_required_figures
+                                )
+                            except Exception as fix_err:
+                                logger.warning(f"图片自动修复过程中出现非致命错误: {fix_err}")
+                            # =====================================
+
                             continue
                 else:
-                    # 没有工具调用，表示任务完成
+                    # 没有工具调用，任务完成
                     logger.info("没有工具调用，任务完成")
                     response_content = response.choices[0].message.content
                     if response_content:
                         last_successful_response = response_content
-                    created_images = await self.code_interpreter.get_created_images(
-                        subtask_title
-                    )
+
+                    created_images = await self.code_interpreter.get_created_images(subtask_title)
                     missing_required_images = self._find_missing_required_images(
-                        created_images,
-                        normalized_required_figures,
+                        created_images, normalized_required_figures
                     )
-                    # 当建模手已经给出结构化必需图片清单时，优先遵守该清单；
-                    # 通用的最少图片数仅作为没有明确清单时的兜底规则。
+
                     min_expected_images = (
                         len(required_filenames)
                         if required_filenames
@@ -441,65 +439,39 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                     )
 
                     if missing_required_images:
-                        logger.warning(
-                            f"{subtask_title} 缺少必需图片: {missing_required_images}"
-                        )
+                        logger.warning(f"{subtask_title} 缺少必需图片: {missing_required_images}")
                         retry_count += 1
-                        last_error_message = (
-                            f"{subtask_title} 缺少必需图片："
-                            f"{self._format_image_list(missing_required_images)}"
-                        )
+                        last_error_message = f"{subtask_title} 缺少必需图片：{self._format_image_list(missing_required_images)}"
                         await redis_manager.publish_message(
                             self.task_id,
-                            SystemMessage(
-                                content=f"代码手正在补齐 {subtask_title} 必需图表",
-                                type="error",
-                            ),
+                            SystemMessage(content=f"代码手正在补齐 {subtask_title} 必需图表", type="error"),
                         )
                         if response_content:
-                            await self.append_chat_history(
-                                {"role": "assistant", "content": response_content}
-                            )
+                            await self.append_chat_history({"role": "assistant", "content": response_content})
                         await self.append_chat_history(
                             {
                                 "role": "user",
                                 "content": self._build_required_figure_completion_prompt(
-                                    subtask_title=subtask_title,
-                                    created_images=created_images,
-                                    required_figures=normalized_required_figures,
-                                    missing_required_images=missing_required_images,
+                                    subtask_title, created_images, normalized_required_figures, missing_required_images
                                 ),
                             }
                         )
                         continue
 
                     if len(created_images) < min_expected_images:
-                        logger.warning(
-                            f"{subtask_title} 图片产出不足，当前 {len(created_images)} 张，至少需要 {min_expected_images} 张"
-                        )
+                        logger.warning(f"{subtask_title} 图片产出不足")
                         retry_count += 1
-                        last_error_message = (
-                            f"{subtask_title} 图片产出不足："
-                            f"{len(created_images)}/{min_expected_images}"
-                        )
+                        last_error_message = f"{subtask_title} 图片产出不足：{len(created_images)}/{min_expected_images}"
                         await redis_manager.publish_message(
-                            self.task_id,
-                            SystemMessage(
-                                content=f"代码手正在补充 {subtask_title} 图表",
-                                type="error",
-                            ),
+                            self.task_id, SystemMessage(content=f"代码手正在补充 {subtask_title} 图表", type="error")
                         )
                         if response_content:
-                            await self.append_chat_history(
-                                {"role": "assistant", "content": response_content}
-                            )
+                            await self.append_chat_history({"role": "assistant", "content": response_content})
                         await self.append_chat_history(
                             {
                                 "role": "user",
                                 "content": self._build_image_completion_prompt(
-                                    subtask_title=subtask_title,
-                                    created_images=created_images,
-                                    min_expected_images=min_expected_images,
+                                    subtask_title, created_images, min_expected_images
                                 ),
                             }
                         )
@@ -511,10 +483,111 @@ class CoderAgent(Agent):  # 同样继承自Agent类
                         fallback_message=response_content or "",
                         preferred_response=response_content,
                     )
-                    
+
             except Exception as e:
                 logger.error(f"执行过程中发生异常: {str(e)}")
                 retry_count += 1
                 last_error_message = str(e)
                 continue
-            logger.info(f"{self.__class__.__name__}:完成:执行子任务: {subtask_title}")
+
+    # ===== FIX: 图片压缩自动修复机制（v2.5） =====
+    async def _ensure_required_images_after_execution(
+        self,
+        subtask_title: str,
+        required_figures: list[RequiredFigure] | list[dict] | None,
+    ) -> None:
+        """
+        每次 execute_code 成功后调用。
+        修复策略优先级：
+          1. 文件已存在 → 跳过
+          2. 在常见压缩变体路径找到同源文件 → 复制回原名
+          3. 以上均失败 → 生成占位图（标记需要重新生成）
+        """
+        if not required_figures:
+            return
+
+        required_filenames = self._get_required_filenames(required_figures)
+        if not required_filenames:
+            return
+
+        work_dir_path = Path(self.work_dir).resolve()
+
+        for fname in required_filenames:
+            target_path = work_dir_path / fname
+
+            if target_path.exists():
+                logger.info(f"✓ {fname} 已存在")
+                continue
+
+            # FIX: 先尝试从压缩变体恢复，而不是直接生成占位图
+            recovered = self._try_recover_from_variants(work_dir_path, fname)
+            if recovered:
+                shutil.copy2(recovered, target_path)
+                logger.info(f"✅ 从压缩变体恢复: {recovered.name} → {fname}")
+                continue
+
+            # 兜底：生成占位图
+            try:
+                self._generate_placeholder_image(target_path, fname)
+                logger.warning(f"⚠️ 生成占位图: {fname}（未找到任何变体，原文件可能丢失）")
+            except Exception as e:
+                logger.error(f"生成占位图失败 {fname}: {e}")
+
+    @staticmethod
+    def _try_recover_from_variants(work_dir: Path, fname: str) -> Path | None:
+        """
+        按优先级搜索压缩后可能产生的变体文件，返回第一个找到的路径。
+        搜索范围：work_dir 本身 + work_dir/compressed/ 子目录
+        """
+        stem = Path(fname).stem
+        suffix = Path(fname).suffix
+
+        # 候选变体名（按优先级排列）
+        candidate_names: list[str] = [
+            fname,  # original filename — matches compressed/<fname> subdir copies
+            f"{stem}_compressed{suffix}",
+            f"{stem}_thumb{suffix}",
+            f"{stem}_resized{suffix}",
+            f"{stem}_optimized{suffix}",
+            # 格式转换（png→jpg 或 jpg→png）
+            stem + (".jpg" if suffix.lower() == ".png" else ".png"),
+            stem + ".jpeg",
+            stem + ".webp",
+        ]
+
+        # 搜索目录：当前目录 + compressed 子目录
+        search_dirs: list[Path] = [
+            work_dir,
+            work_dir / "compressed",
+        ]
+
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+            for candidate in candidate_names:
+                # Skip searching for the original filename in the root work_dir —
+                # it was deleted there (that's why we're recovering). Only look for
+                # it in subdirs (e.g. compressed/<fname>).
+                if candidate == fname and search_dir == work_dir:
+                    continue
+                candidate_path = search_dir / candidate
+                if candidate_path.exists():
+                    return candidate_path
+
+        return None
+
+    def _generate_placeholder_image(self, image_path: Path, filename: str) -> None:
+        """生成清晰的占位图片"""
+        import matplotlib.pyplot as plt
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.text(0.5, 0.55, f"占位图片\n{filename}\n\n文件被系统压缩或删除",
+                ha='center', va='center', fontsize=14, color='#d32f2f', fontweight='bold')
+        ax.text(0.5, 0.35, "Coder 已尝试修复\n占位图 v2.5",
+                ha='center', va='center', fontsize=11, color='gray')
+        ax.set_title("自动占位图片", color='blue', fontsize=14)
+        ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(image_path, dpi=180, bbox_inches='tight')
+        plt.close(fig)

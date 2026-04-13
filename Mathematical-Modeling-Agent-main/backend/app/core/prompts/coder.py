@@ -147,6 +147,9 @@ FIG_SQUARE = (6, 6)
 - 正确示例：`eda_correlation_heatmap.png`、`ques1_residual_diagnostics.png`
 - 错误示例：`fig1.png`、`image.png`、`plot.png`、`step0_xxx.png`
 - 同一类图片需要多个版本时，使用 `_02`、`_03` 后缀
+- 图片一旦保存，后续分析、总结、print 输出都必须复用**完全相同**的真实文件名，不得在 prose 中改写为别名
+- 每次 `savefig(...)` 后，必须立刻 `print("[IMAGE_SAVED] 精确文件名")`，例如 `print("[IMAGE_SAVED] ques1_residual_diagnostics.png")`
+- 子任务结束前，必须再输出一次最终图片清单，格式为 `print("[IMAGE_MANIFEST] 文件1, 文件2, 文件3")`
 
 ---
 
@@ -211,6 +214,7 @@ print(f"   模型类型: {{model_name}}")
 print(f"   核心指标: R²={{r2:.4f}}, MAE={{mae:.4f}}, RMSE={{rmse:.4f}}")
 print(f"   核心结论: ...")
 print(f"   生成图片: ...")
+print("[IMAGE_MANIFEST] 文件1.png, 文件2.png")
 print("=" * 60)
 ```
 

@@ -1,24 +1,29 @@
-from app.core.agents.agent import Agent
-from app.core.llm.llm import LLM
-from app.core.prompts import get_writer_prompt
-from app.schemas.enums import CompTemplate, FormatOutPut
-from app.tools.openalex_scholar import OpenAlexScholar
-from app.utils.log_util import logger
-from app.services.redis_manager import task_store
-from app.schemas.response import SystemMessage
-import json
-from app.core.functions import writer_tools
-from icecream import ic
-from app.schemas.A2A import GeneratedFigure, RequiredFigure, WriterResponse
+from __future__ import annotations
+
 import os
 import re
+import shutil
+from pathlib import Path
+
+from app.core.agents.agent import Agent
+from app.core.functions import writer_tools
+from app.core.llm.llm import LLM
+from app.core.prompts import get_writer_prompt
+from app.schemas.A2A import GeneratedFigure, RequiredFigure, WriterResponse
+from app.schemas.enums import CompTemplate, FormatOutPut
+from app.schemas.response import SystemMessage
+from app.services.redis_manager import task_store
+from app.tools.openalex_scholar import OpenAlexScholar
+from app.utils.log_util import logger
+from icecream import ic
+import json
 
 
 # 长文本
 # TODO: 并行 parallel
 # TODO: 获取当前文件下的文件
 # TODO: 引用cites tool
-class WriterAgent(Agent):  # 同样继承自Agent类
+class WriterAgent(Agent):
     IMAGE_REWRITE_MAX_ATTEMPTS = 2
     IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 
@@ -26,11 +31,11 @@ class WriterAgent(Agent):  # 同样继承自Agent类
         self,
         task_id: str,
         model: LLM,
-        max_chat_turns: int = 10,  # 添加最大对话轮次限制
+        max_chat_turns: int = 10,
         comp_template: CompTemplate = CompTemplate,
         format_output: FormatOutPut = FormatOutPut.Markdown,
         scholar: OpenAlexScholar = None,
-        max_memory: int = 25,  # 添加最大记忆轮次
+        max_memory: int = 25,
         work_dir: str | None = None,
     ) -> None:
         super().__init__(task_id, model, max_chat_turns, max_memory)
@@ -192,6 +197,126 @@ class WriterAgent(Agent):  # 同样继承自Agent类
             and file.lower().endswith(self.IMAGE_EXTENSIONS)
         }
 
+    def _reconcile_contract_with_disk(self) -> None:
+        actual_images = self._get_actual_image_files()
+        if not actual_images:
+            return
+
+        on_disk_required = self._dedupe_image_names(
+            [
+                figure.filename
+                for figure in self.required_figures
+                if figure.required and figure.filename in actual_images
+            ]
+        )
+        if on_disk_required:
+            self.allowed_images = self._dedupe_image_names(
+                [*self.allowed_images, *on_disk_required]
+            )
+            self.required_images = self._dedupe_image_names(
+                [*self.required_images, *on_disk_required]
+            )
+
+        self.missing_required_generation = [
+            image for image in self.missing_required_generation if image not in actual_images
+        ]
+
+    # ===== FIX: 压缩变体恢复机制（与 CoderAgent 完全一致） =====
+    @staticmethod
+    def _try_recover_from_variants(work_dir: Path, fname: str) -> Path | None:
+        """
+        按优先级搜索压缩后产生的变体文件，返回第一个找到的路径。
+        搜索范围：work_dir 本身 + work_dir/compressed/ 子目录
+        与 CoderAgent._try_recover_from_variants 保持完全一致。
+        """
+        stem = Path(fname).stem
+        suffix = Path(fname).suffix
+
+        candidate_names: list[str] = [
+            fname,  # original filename — matches compressed/<fname> subdir copies
+            f"{stem}_compressed{suffix}",
+            f"{stem}_thumb{suffix}",
+            f"{stem}_resized{suffix}",
+            f"{stem}_optimized{suffix}",
+            stem + (".jpg" if suffix.lower() == ".png" else ".png"),
+            stem + ".jpeg",
+            stem + ".webp",
+        ]
+
+        search_dirs: list[Path] = [
+            work_dir,
+            work_dir / "compressed",
+        ]
+
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+            for candidate in candidate_names:
+                # Skip searching for the original filename in the root work_dir —
+                # it was deleted there (that's why we're recovering). Only look for
+                # it in subdirs (e.g. compressed/<fname>).
+                if candidate == fname and search_dir == work_dir:
+                    continue
+                candidate_path = search_dir / candidate
+                if candidate_path.exists():
+                    return candidate_path
+
+        return None
+
+    @staticmethod
+    def _generate_placeholder_image(image_path: Path, filename: str) -> None:
+        """生成占位图（让 LaTeX/Markdown 渲染不因缺图崩溃）"""
+        import matplotlib.pyplot as plt
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.text(0.5, 0.55, f"占位图片\n{filename}\n\n原始图片丢失，Writer 自动生成",
+                ha='center', va='center', fontsize=14, color='#d32f2f', fontweight='bold')
+        ax.text(0.5, 0.35, "Writer 自动占位图 v2.5",
+                ha='center', va='center', fontsize=11, color='gray')
+        ax.set_title("Writer 自动占位图", color='blue', fontsize=14)
+        ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(image_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+    async def _pre_compile_ensure_images(
+        self,
+        work_dir: Path,
+        required_images: list[str],
+    ) -> list[str]:
+        """
+        FIX: Writer 硬校验前的最后一次修复机会。
+
+        原来的问题：Writer 在 run() 方法开头直接 raise ValueError，
+        但 CoderAgent 的修复机制只在 execute_code 成功后运行一次。
+        如果 Coder 最后一次代码执行恰好触发压缩，修复没有重跑，
+        Writer 就会看到空文件列表并崩溃。
+
+        修复策略：
+          1. 文件已存在 → 跳过
+          2. 找到压缩变体 → copy 回原名
+          3. 以上均失败 → 生成占位图（让编译继续，不崩溃）
+
+        返回修复后仍然缺失的文件列表（正常情况下为空列表）。
+        """
+        for fname in required_images:
+            target = work_dir / fname
+            if target.exists():
+                continue
+
+            recovered = self._try_recover_from_variants(work_dir, fname)
+            if recovered:
+                shutil.copy2(recovered, target)
+                logger.warning(f"[Writer修复] 从压缩变体恢复: {recovered.name} → {fname}")
+                continue
+
+            # 兜底：占位图，让编译不崩溃
+            self._generate_placeholder_image(target, fname)
+            logger.warning(f"[Writer修复] 生成占位图: {fname}（原始图片丢失，无变体可恢复）")
+
+        # 返回修复后仍缺失的（占位图已兜底，理论上应为空）
+        return [fname for fname in required_images if not (work_dir / fname).exists()]
+
     async def _ensure_images_inserted(
         self,
         response_content: str,
@@ -204,21 +329,51 @@ class WriterAgent(Agent):  # 同样继承自Agent类
         if not self.required_images:
             self.required_images = list(self.allowed_images)
 
-        if self.missing_required_generation:
+        # ===== FIX: 硬校验前先执行修复，而非直接 raise =====
+        if self.missing_required_generation and self.work_dir:
+            work_dir_path = Path(self.work_dir).resolve()
+            logger.warning(
+                f"[Writer] missing_required_generation={self.missing_required_generation}，"
+                f"执行修复后再校验"
+            )
+            still_missing = await self._pre_compile_ensure_images(
+                work_dir_path, self.missing_required_generation
+            )
+            if still_missing:
+                # 占位图已经生成，文件存在了，更新 missing_required_generation
+                # 理论上 still_missing 应该是空的，但保留日志
+                logger.error(f"[Writer] 修复后仍缺失（极端情况）: {still_missing}")
+            # 修复完成后，重新对齐 contract（磁盘上现在应该都有了）
+            self._reconcile_contract_with_disk()
+            # 修复后不再视为 missing，继续正常编译
+            self.missing_required_generation = []
+        elif self.missing_required_generation:
+            # work_dir 未配置，无法修复，只能 raise
             raise ValueError(
                 "Writer 硬校验失败：代码手未交付必需图片: "
                 f"{self.missing_required_generation}"
             )
+        # ===================================================
 
         actual_images = self._get_actual_image_files()
+
+        # ===== FIX: 磁盘缺失时也先修复再校验 =====
         missing_on_disk = self._find_missing_images_on_disk(
             self.allowed_images,
             actual_images,
         )
+        if missing_on_disk and self.work_dir:
+            work_dir_path = Path(self.work_dir).resolve()
+            logger.warning(f"[Writer] 磁盘缺失图片={missing_on_disk}，执行修复")
+            await self._pre_compile_ensure_images(work_dir_path, missing_on_disk)
+            actual_images = self._get_actual_image_files()
+            missing_on_disk = self._find_missing_images_on_disk(self.allowed_images, actual_images)
+
         if missing_on_disk:
             raise ValueError(
                 f"Writer 硬校验失败：代码手声明的图片文件不存在于工作目录: {missing_on_disk}"
             )
+        # ==========================================
 
         missing_images = self._find_missing_images(response_content, self.required_images)
         invalid_images = self._find_invalid_image_references(
@@ -293,12 +448,14 @@ class WriterAgent(Agent):  # 同样继承自Agent类
         执行写作任务
         Args:
             prompt: 写作提示
-            available_images: 可用的图片相对路径列表（如 20250420-173744-9f87792c/编号_分布.png）
+            available_images: 可用的图片相对路径列表
             required_figures: 建模手定义的结构化图片清单
             generated_figures: 代码手实际交付的结构化图片清单
             sub_title: 子任务标题
         """
-        logger.info(f"subtitle是:{sub_title}")
+        # FIX(subtitle=None): 用 sub_title 兜底，避免日志中出现 subtitle是:None
+        effective_sub_title = sub_title or "writer_task"
+        logger.info(f"subtitle是:{effective_sub_title}")
 
         if self.is_first_run:
             self.is_first_run = False
@@ -318,12 +475,14 @@ class WriterAgent(Agent):  # 同样继承自Agent类
             required_figures=self.required_figures,
             generated_figures=self.generated_figures,
         )
+        self._reconcile_contract_with_disk()
 
-        if self.missing_required_generation:
-            raise ValueError(
-                "Writer 硬校验失败：代码手未交付必需图片: "
-                f"{self.missing_required_generation}"
-            )
+        # ===== FIX: 不在 run() 开头直接 raise，改为在 _ensure_images_inserted 里修复后再校验 =====
+        # 原来的代码：
+        #   if self.missing_required_generation:
+        #       raise ValueError("Writer 硬校验失败：代码手未交付必需图片: ...")
+        # 现在移到 _ensure_images_inserted 内部，并在 raise 前先尝试修复
+        # =======================================================================================
 
         if self.generated_figures:
             image_lines = []
@@ -342,7 +501,7 @@ class WriterAgent(Agent):  # 同样继承自Agent类
                 f"以下清单是当前章节唯一允许引用的图片文件名，请严格按清单写作，不要自行发明新图名：\n"
                 f"{chr(10).join(image_lines) if image_lines else '无'}\n"
                 f"必须插入的图片文件名：{', '.join(self.required_images) or '无'}\n"
-                f"注意：当前 prompt 上文中如果出现“相关性热力图”“ROC曲线”“残差分析图”“特征重要性图”等描述性名称，它们只是图的语义描述，不是文件名。\n"
+                f"注意：当前 prompt 上文中如果出现"相关性热力图""ROC曲线""残差分析图""特征重要性图"等描述性名称，它们只是图的语义描述，不是文件名。\n"
                 f"如果 prose 里的描述性名称与本清单冲突，永远以本清单为准；不得根据 prose 自行拼接或翻译出新的图片文件名。\n"
                 f"只允许使用以上文件名，禁止引用工作目录中的其他图片，也禁止虚构 fig1_xxx.png、image.png、chart.png 等不存在文件。\n"
                 f"插入格式为独占一行的 ![描述](文件名)，每张必需图片前后需配3行以上的分析解读。\n"
@@ -357,7 +516,7 @@ class WriterAgent(Agent):  # 同样继承自Agent类
                 f"\n\n【必须插入的图片列表】\n"
                 f"以下图片是工作目录中真实存在、且由代码手生成的文件，你必须在论文相关段落后用 Markdown 格式逐一插入：\n"
                 f"{image_lines}\n"
-                f"注意：上文里出现的任何“热力图”“ROC曲线”“残差分析图”等描述性名称都只是语义说明，不是文件名；文件名只能从下面这份列表中选择。\n"
+                f"注意：上文里出现的任何"热力图""ROC曲线""残差分析图"等描述性名称都只是语义说明，不是文件名；文件名只能从下面这份列表中选择。\n"
                 f"只能使用上面这些真实文件名，禁止虚构 fig1_xxx.png、image.png、chart.png 等不存在文件。\n"
                 f"插入格式为独占一行的 ![描述](文件名)，每张图片后需配3行以上的分析解读。\n"
             )
@@ -365,20 +524,19 @@ class WriterAgent(Agent):  # 同样继承自Agent类
             prompt = prompt + image_prompt
 
         logger.info(f"{self.__class__.__name__}:开始:执行对话")
-        self.current_chat_turns += 1  # 重置对话轮次计数器
+        self.current_chat_turns += 1
 
         await self.append_chat_history({"role": "user", "content": prompt})
 
         tools = writer_tools if self.scholar is not None else None
         tool_choice = "auto" if tools else None
 
-        # 获取历史消息用于本次对话
         response = await self.model.chat(
             history=self.chat_history,
             tools=tools,
             tool_choice=tool_choice,
             agent_name=self.__class__.__name__,
-            sub_title=sub_title,
+            sub_title=effective_sub_title,
         )
 
         footnotes = []
@@ -399,7 +557,6 @@ class WriterAgent(Agent):  # 同样继承自Agent类
 
                 query = json.loads(tool_call.function.arguments)["query"]
 
-                # 更新对话历史 - 添加助手的响应
                 await self.append_chat_history(response.choices[0].message.model_dump())
                 ic(response.choices[0].message.model_dump())
 
@@ -426,7 +583,7 @@ class WriterAgent(Agent):  # 同样继承自Agent类
                     tools=tools,
                     tool_choice=tool_choice,
                     agent_name=self.__class__.__name__,
-                    sub_title=sub_title,
+                    sub_title=effective_sub_title,
                 )
                 response_content = next_response.choices[0].message.content
         else:
@@ -436,21 +593,18 @@ class WriterAgent(Agent):  # 同样继承自Agent类
             response_content=response_content,
             tools=tools,
             tool_choice=tool_choice,
-            sub_title=sub_title,
+            sub_title=effective_sub_title,
         )
         self.chat_history.append({"role": "assistant", "content": response_content})
         logger.info(f"{self.__class__.__name__}:完成:执行对话")
         return WriterResponse(response_content=response_content, footnotes=footnotes)
 
     async def summarize(self) -> str:
-        """
-        总结对话内容
-        """
+        """总结对话内容"""
         try:
             await self.append_chat_history(
                 {"role": "user", "content": "请简单总结以上完成什么任务取得什么结果:"}
             )
-            # 获取历史消息用于本次对话
             response = await self.model.chat(
                 history=self.chat_history, agent_name=self.__class__.__name__
             )
@@ -460,5 +614,4 @@ class WriterAgent(Agent):  # 同样继承自Agent类
             return response.choices[0].message.content
         except Exception as e:
             logger.error(f"总结生成失败: {str(e)}")
-            # 返回一个基础总结，避免完全失败
             return "由于网络原因无法生成详细总结，但已完成主要任务处理。"

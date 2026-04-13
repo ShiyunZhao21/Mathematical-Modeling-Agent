@@ -267,6 +267,8 @@ class MathModelWorkFlow(WorkFlow):
                     problem_digest=problem_digest,
                     problem_analysis=problem_analysis,
                     conclusion_memory_markdown=conclusion_memory_manager.to_markdown(),
+                    available_images=coder_response.created_images,
+                    generated_figures=coder_response.generated_figures,
                 )
 
                 await self._publish_stage(

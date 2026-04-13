@@ -41,6 +41,37 @@ class GeneratedFigure(BaseModel):
     generated: bool = True
 
 
+class CompressedImageRecord(BaseModel):
+    filename: str
+    section: str = ""
+    required: bool = False
+    generated: bool = True
+    purpose: str = ""
+
+
+class CompressedSectionState(BaseModel):
+    section_key: str
+    allowed_images: list[str] = Field(default_factory=list)
+    required_images: list[str] = Field(default_factory=list)
+    generated_images: list[str] = Field(default_factory=list)
+    locked_identifiers: list[str] = Field(default_factory=list)
+    open_tasks: list[str] = Field(default_factory=list)
+    facts: list[str] = Field(default_factory=list)
+
+
+class CompressedAgentMemory(BaseModel):
+    current_section: str = ""
+    completed_sections: list[str] = Field(default_factory=list)
+    open_tasks: list[str] = Field(default_factory=list)
+    allowed_images: list[str] = Field(default_factory=list)
+    required_images: list[str] = Field(default_factory=list)
+    generated_images: list[str] = Field(default_factory=list)
+    locked_identifiers: list[str] = Field(default_factory=list)
+    image_records: list[CompressedImageRecord] = Field(default_factory=list)
+    section_states: dict[str, CompressedSectionState] = Field(default_factory=dict)
+    section_facts: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class QuestionModelPlan(BaseModel):
     question_key: str
     goal: str = ""
@@ -74,8 +105,11 @@ class CoderToWriter(BaseModel):
     code_output: str | None = None
     created_images: list[str] | None = None
     generated_figures: list[GeneratedFigure] | None = None
+    status: str = "ok"
+    warnings: list[str] = Field(default_factory=list)
 
 
 class WriterResponse(BaseModel):
     response_content: Any
     footnotes: list[tuple[str, str]] | None = None
+    warnings: list[str] = Field(default_factory=list)
